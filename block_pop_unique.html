@@ -116,7 +116,7 @@ const N=8, boardEl=document.getElementById('board'), piecesEl=document.getElemen
 let grid=Array.from({length:N},()=>Array(N).fill(null)), score=0, best=+localStorage.blockPopBest||0, lines=0, combo=0, muted=false;
 let pieces=[null,null,null];
 let nickname=localStorage.blockPopNickname||'';
-let db=null, firebaseReady=false, currentUid=null;
+let db=null, firebaseReady=false, currentUid=null, firebaseAuthStarting=false, firebaseAuthPromise=null;
 let nicknameClaimed=false;
 
 // Firebase config: replace these values with your own Firebase Web App config.
@@ -135,18 +135,41 @@ const FIREBASE_CONFIG={
 function initLeaderboard(){
  try{
    if(FIREBASE_CONFIG.apiKey.startsWith('YOUR_')) return;
+   if(typeof firebase==='undefined') throw new Error('Firebase SDK did not load.');
    firebase.initializeApp(FIREBASE_CONFIG);
    db=firebase.database();
-   firebase.auth().onAuthStateChanged(user=>{
-     currentUid=user?.uid||null;
-     firebaseReady=!!user;
-     if(user && nickname) checkNicknameClaim(nickname);
+   firebaseAuthStarting=true;
+   firebaseAuthPromise=new Promise(resolve=>{
+     let settled=false;
+     firebase.auth().onAuthStateChanged(user=>{
+       currentUid=user?.uid||null;
+       firebaseReady=!!user;
+       firebaseAuthStarting=!user;
+       if(user && nickname) checkNicknameClaim(nickname);
+       updateFirebaseStatus();
+       if(user && !settled){settled=true;resolve(user);}
+     });
    });
    firebase.auth().signInAnonymously().catch(e=>{
      console.warn('Anonymous sign-in failed:',e);
      firebaseReady=false;
+     firebaseAuthStarting=false;
+     updateFirebaseStatus('❌ Firebase Anonymous Sign-in is not enabled. Enable it in Authentication → Sign-in method.');
    });
- }catch(e){console.warn('Leaderboard setup:',e)}
+ }catch(e){
+   console.warn('Leaderboard setup:',e);
+   firebaseReady=false;
+   firebaseAuthStarting=false;
+   updateFirebaseStatus('Firebase could not start. Check your Firebase settings.');
+ }
+}
+
+function updateFirebaseStatus(errorText=''){
+ const status=document.getElementById('chatStatus');
+ if(!status) return;
+ if(errorText){ status.textContent=errorText; return; }
+ if(firebaseReady) status.textContent='Connected • messages are public.';
+ else if(firebaseAuthStarting) status.textContent='Connecting to Firebase…';
 }
 
 function nicknameKey(name){
@@ -156,8 +179,14 @@ function nicknameKey(name){
 async function claimNickname(name){
  const clean=name.trim().replace(/[^a-zA-Z0-9 _.-]/g,'').replace(/\s+/g,' ').slice(0,14);
  if(!clean) return {ok:false,message:'Enter a nickname.'};
- if(!firebaseReady || !db || !currentUid){
-   return {ok:true,message:'Nickname saved on this device. Connect Firebase for global name protection.'};
+ if(!db){
+   return {ok:false,message:'Firebase is not connected. Check your Firebase setup.'};
+ }
+ if(!firebaseReady && firebaseAuthPromise){
+   try{ await Promise.race([firebaseAuthPromise,new Promise((_,reject)=>setTimeout(()=>reject(new Error('auth-timeout')),7000))]); }catch(e){}
+ }
+ if(!firebaseReady || !currentUid){
+   return {ok:false,message:'Firebase sign-in is unavailable. Enable Anonymous sign-in in Firebase Authentication.'};
  }
  const key=nicknameKey(clean);
  if(!key) return {ok:false,message:'That nickname is not valid.'};
@@ -190,12 +219,17 @@ function saveLocalScore(name,value){
  localStorage.blockPopScores=JSON.stringify(a.slice(0,3));
 }
 
-function submitScore(){
- if(window.__scoreSubmitted || !nickname || score<=0) return;
- window.__scoreSubmitted=true;
+async function submitScore(){
+ if(window.__scoreSubmitted || !nickname || score<=0) return false;
  saveLocalScore(nickname,score);
- if(firebaseReady&&db){
-   db.ref('leaderboard').push({name:nickname.slice(0,14),score:score,createdAt:firebase.database.ServerValue.TIMESTAMP}).catch(()=>{});
+ if(!firebaseReady || !db || !currentUid) return false;
+ try{
+   await db.ref('leaderboard').push({name:nickname.slice(0,14),score:Number(score),createdAt:firebase.database.ServerValue.TIMESTAMP,uid:currentUid});
+   window.__scoreSubmitted=true;
+   return true;
+ }catch(e){
+   console.warn('Score submit failed:',e);
+   return false;
  }
 }
 
@@ -455,9 +489,11 @@ function startDrag(e,i){
  move(e);
 }
 function gameOver(){
+ const wasBest=score>best;
  submitScore();
+ if(wasBest){best=score;localStorage.blockPopBest=best;}
  document.getElementById('final').textContent=score.toLocaleString();
- document.getElementById('newbest').textContent=score>=best&&score>0?'🏆 New best score!':'';
+ document.getElementById('newbest').textContent=wasBest?'🏆 New best score!':'';
  document.getElementById('over').style.display='flex';
 }
 document.getElementById('restart').onclick=()=>{
@@ -471,7 +507,7 @@ document.getElementById('playBtn').onclick=async()=>{
  const n=document.getElementById('nickname').value.trim().replace(/[^a-zA-Z0-9 _.-]/g,'').replace(/\s+/g,' ').slice(0,14);
  const status=document.getElementById('nicknameStatus');
  if(!n){status.textContent='Please enter a nickname.';document.getElementById('nickname').focus();return;}
- status.textContent='Checking nickname…';
+ status.textContent=firebaseReady?'Checking nickname…':'Connecting to Firebase…';
  document.getElementById('playBtn').disabled=true;
  const result=await claimNickname(n);
  document.getElementById('playBtn').disabled=false;
@@ -510,8 +546,8 @@ function cleanChatText(v){
 }
 function openChat(){
  document.getElementById('chatOverlay').style.display='flex';
+ updateFirebaseStatus();
  if(firebaseReady&&db){
-   document.getElementById('chatStatus').textContent='Connected • messages are public.';
    if(!chatListener){
      chatListener=db.ref('chat').orderByChild('createdAt').limitToLast(50);
      chatListener.on('value',snap=>{
@@ -526,13 +562,24 @@ function openChat(){
    document.getElementById('chatStatus').textContent='Firebase is not connected yet. Add your Firebase config first.';
  }
 }
-function sendChat(){
+async function sendChat(){
  const input=document.getElementById('chatInput');
  const text=cleanChatText(input.value);
- if(!text||!nickname)return;
- if(!firebaseReady||!db){document.getElementById('chatStatus').textContent='Connect Firebase before sending messages.';return;}
- input.value='';
- db.ref('chat').push({name:nickname.slice(0,14),text,createdAt:firebase.database.ServerValue.TIMESTAMP}).catch(()=>{document.getElementById('chatStatus').textContent='Message failed to send.';});
+ if(!text){document.getElementById('chatStatus').textContent='Type a message first.';return;}
+ if(!nickname){document.getElementById('chatStatus').textContent='Choose your nickname first.';return;}
+ if(firebaseAuthStarting){document.getElementById('chatStatus').textContent='Still connecting to Firebase…';return;}
+ if(!firebaseReady||!db){document.getElementById('chatStatus').textContent='You are not connected. Enable Anonymous sign-in in Firebase Authentication.';return;}
+ const send=document.getElementById('sendChat');
+ send.disabled=true;
+ try{
+   await db.ref('chat').push({name:nickname.slice(0,14),text,createdAt:firebase.database.ServerValue.TIMESTAMP,uid:currentUid});
+   input.value='';
+   document.getElementById('chatStatus').textContent='Message sent ✓';
+ }catch(e){
+   console.warn('Chat send failed:',e);
+   const msg=e?.code==='PERMISSION_DENIED'?'❌ Firebase denied the message. Check Realtime Database Rules.':(e?.message||'Message failed to send.');
+   document.getElementById('chatStatus').textContent=msg;
+ }finally{send.disabled=false;}
 }
 document.getElementById('chatBtn').onclick=openChat;
 document.getElementById('closeChat').onclick=()=>document.getElementById('chatOverlay').style.display='none';
